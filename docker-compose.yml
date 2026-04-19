@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - db_data:/app/data
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      - DB_PATH=/app/data/iot_security.db
+      - BLOCK_DURATION=${BLOCK_DURATION:-30}
+      - RATE_LIMIT=${RATE_LIMIT:-20}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  db_data:

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+backend/venv/
+backend/.venv/
+backend/env/
+
+# Database — never commit the actual DB
+*.db
+*.sqlite3
+
+# Environment — never commit secrets
+.env
+backend/.env
+frontend/.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

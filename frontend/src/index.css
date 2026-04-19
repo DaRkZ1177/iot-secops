@@ -1,0 +1,170 @@
+/* ── DESIGN.md Token System ──────────────────────────────────────────────── */
+:root {
+  /* Backgrounds — deep purple-black, never pure #000 */
+  --bg:           #1f1633;
+  --bg-deep:      #150f23;
+  --bg-surface:   #2a1f44;
+  --bg-card:      #241a3a;
+  --bg-card2:     #1d1530;
+  --bg-elevated:  #2f2350;
+
+  /* Borders — purple-tinted, never neutral gray */
+  --border:       #362d59;
+  --border-light: #584674;
+  --border-subtle:#2a2244;
+
+  /* Text */
+  --text-primary:   #ffffff;
+  --text-secondary: #e5e7eb;
+  --text-muted:     #9b8fbc;
+  --text-dim:       #6b5d8a;
+  --text-code:      #dcdcaa;
+
+  /* Brand accents */
+  --purple:       #6a5fc1;
+  --purple-muted: #79628c;
+  --purple-deep:  #422082;
+  --lime:         #c2ef4e;
+  --coral:        #ffb287;
+  --pink:         #fa7faa;
+
+  /* Semantic — security specific */
+  --red:          #ff4d6a;
+  --red-dim:      rgba(255,77,106,0.14);
+  --orange:       #ff8c42;
+  --orange-dim:   rgba(255,140,66,0.12);
+  --yellow:       #f5c842;
+  --yellow-dim:   rgba(245,200,66,0.10);
+  --green:        #3ecf8e;
+  --green-dim:    rgba(62,207,142,0.10);
+  --cyan:         #38bdf8;
+  --cyan-dim:     rgba(56,189,248,0.10);
+
+  /* Glass */
+  --glass-white:  rgba(255,255,255,0.08);
+  --glass-purple: rgba(54,22,107,0.14);
+
+  /* Shadows — purple-tinted per DESIGN.md */
+  --shadow-ambient:   rgba(22,15,36,0.9) 0px 4px 4px 9px;
+  --shadow-card:      rgba(0,0,0,0.1) 0px 10px 15px -3px;
+  --shadow-elevated:  rgba(0,0,0,0.18) 0px 0.5rem 1.5rem;
+  --shadow-inset:     rgba(0,0,0,0.1) 0px 1px 3px 0px inset;
+  --shadow-surface:   rgba(0,0,0,0.08) 0px 2px 8px;
+
+  /* Layout */
+  --sidebar-w:    232px;
+  --topbar-h:     56px;
+  --radius-sm:    6px;
+  --radius:       8px;
+  --radius-md:    10px;
+  --radius-lg:    13px;
+  --radius-xl:    18px;
+
+  /* Fonts — DESIGN.md spec */
+  --font-ui:      'Rubik', -apple-system, system-ui, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --font-mono:    'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+/* Scrollbar — purple-tinted */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg-deep); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
+
+/* Page enter */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.page-enter { animation: fadeUp 0.22s ease forwards; }
+
+/* Staggered card reveals */
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.card-1 { animation: cardIn 0.25s ease 0.04s both; }
+.card-2 { animation: cardIn 0.25s ease 0.08s both; }
+.card-3 { animation: cardIn 0.25s ease 0.12s both; }
+.card-4 { animation: cardIn 0.25s ease 0.16s both; }
+.card-5 { animation: cardIn 0.25s ease 0.20s both; }
+
+/* Threat blink */
+@keyframes threat-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(255,77,106,0.4); }
+  50%       { opacity: 0.85; box-shadow: 0 0 0 6px rgba(255,77,106,0); }
+}
+
+/* Live pulse dot */
+@keyframes live-pulse {
+  0%   { transform: scale(1); opacity: 1; }
+  50%  { transform: scale(1.5); opacity: 0.4; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.live-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--lime);
+  animation: live-pulse 2s ease infinite;
+  display: inline-block;
+  box-shadow: 0 0 8px rgba(194,239,78,0.6);
+}
+
+/* Subtle grid texture on deep bg */
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(106,95,193,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(106,95,193,0.04) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* Glass panel */
+.glass {
+  background: var(--glass-white);
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+}
+
+/* Uppercase label system — DESIGN.md core pattern */
+.label {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.8;
+  letter-spacing: 0.25px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Code / mono */
+.mono {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--text-code);
+}
+
+/* Nav active bar */
+.nav-active-bar {
+  position: absolute;
+  left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 3px; height: 20px;
+  background: var(--lime);
+  border-radius: 0 2px 2px 0;
+  box-shadow: 0 0 10px rgba(194,239,78,0.5);
+}
+
+button { cursor: pointer; font-family: var(--font-ui); border: none; background: none; }
+input, select { font-family: var(--font-ui); outline: none; }
+a { text-decoration: none; color: inherit; }
