@@ -24,15 +24,16 @@
 
 ## What is IoT SecOps?
 
-IoT SecOps is a real-time security monitoring platform for IoT device networks. It acts as a gateway that inspects both **HTTP/REST** and **MQTT** traffic, detects attacks in real time, and displays them on a live SOC-style dashboard — with persistent history, user authentication, and one-click CSV/JSON export.
+IoT SecOps is a real-time security monitoring platform for IoT device networks. It acts as a gateway that inspects both **HTTP/REST** and **MQTT** traffic, detects attacks in real time, and displays them on a live SOC-style dashboard — with persistent history, user authentication, manual IP management, and one-click CSV/JSON export.
 
 ```
   IoT Devices                FastAPI Gateway              Dashboard
   ───────────────    →    ───────────────────    →    ──────────────────
   HTTP sensors             Rate limit detection         Live threat feed
   MQTT publishers          Anomaly detection            Attack analytics
-  Simulated attacks        IP blocking (30s)            Device profiling
-                           SQLite persistence           Export reports
+  Simulated attacks        Behavioral drift (EMA)       Device profiling
+                           Manual block / safe list     Export reports
+                           SQLite persistence           User auth
 ```
 
 ---
@@ -41,16 +42,18 @@ IoT SecOps is a real-time security monitoring platform for IoT device networks. 
 
 |   | Feature | Description |
 |---|---------|-------------|
-| 🔍 | **Dual-Protocol Detection** | HTTP/REST and MQTT traffic monitoring with per-protocol rules |
-| ⚡ | **Real-Time Blocking** | Rate limiting, anomaly burst detection, automatic IP blocking |
-| 📊 | **Live Dashboard** | 4-second polling with threat level indicator and event feed |
-| 📈 | **Analytics & History** | Per-minute metric snapshots in SQLite — survives restarts |
-| 🔐 | **User Authentication** | JWT-based login with role support |
-| 📤 | **Export Reports** | Download events as CSV or JSON with time/protocol filters |
-| 🖥️ | **Device Intelligence** | Per-IP behavioral profiling with risk scoring |
-| 🐳 | **Docker Ready** | One-command deploy with `docker compose up` |
-| 💾 | **Persistent Storage** | SQLite stores all events and metrics across restarts |
-| ✅ | **CI/CD** | GitHub Actions runs on every push |
+| 🔍 | **Dual-Protocol Detection** | HTTP/REST and MQTT traffic monitoring with per-protocol thresholds |
+| ⚡ | **Real-Time Blocking** | Rate limiting, anomaly burst detection, automatic 30s IP blocking |
+| 🧠 | **Behavioral Drift Detection** | Exponential moving average baseline per device — flags gradual traffic shifts |
+| 🚫 | **Manual IP Management** | Block or safe-list any IP permanently via API (`/block_ip`, `/unblock_ip`, `/mark_safe`) |
+| 📊 | **Live Dashboard** | 4-second polling with animated threat level indicator and event feed |
+| 📈 | **Analytics & History** | Per-minute metric snapshots in SQLite — survives restarts, no data loss |
+| 🔐 | **User Authentication** | JWT-based login, session persistence, role display, logout |
+| 📤 | **Export Reports** | Download events as CSV or JSON with time range and protocol filters |
+| 🖥️ | **Device Intelligence** | Per-IP behavioral profiling, risk scoring, click-to-expand detail panel |
+| 🐳 | **Docker Ready** | One-command deploy with `docker compose up -d` |
+| 💾 | **Persistent Storage** | SQLite stores all events, metrics history, and users across restarts |
+| ✅ | **CI/CD** | GitHub Actions — installs, starts backend, health-checks, builds frontend on every push |
 
 ---
 
@@ -69,15 +72,18 @@ IoT SecOps is a real-time security monitoring platform for IoT device networks. 
 
 ### Detection Rules
 
-| Protocol | Rule | Threshold | Action |
+| Protocol | Rule | Mechanism | Action |
 |----------|------|-----------|--------|
-| HTTP | Rate Limit | >20 req / 5s | Block IP 30s |
-| HTTP | Anomaly Burst | >8 req / 1s | Warn + log |
-| MQTT | Flood | >15 pub / 5s | Block client 30s |
-| MQTT | Burst | >6 pub / 1s | Warn + log |
+| HTTP | Rate Limit | >20 req / 5s window | Block IP 30s |
+| HTTP | Anomaly Burst | >8 req / 1s window | Warn + log |
+| HTTP | Behavioral Drift | Request rate > 2× EMA baseline | Warn + log |
+| HTTP | Manual Block | IP in block list | Reject immediately |
+| MQTT | Flood | >15 pub / 5s window | Block client 30s |
+| MQTT | Burst | >6 pub / 1s window | Warn + log |
 | MQTT | Auth Fail | Bad credentials | Log event |
 | MQTT | Brute Force | >8 CONNECT / 10s | Block + log |
-| MQTT | Oversized | Payload > 1024B | Reject + log |
+| MQTT | Oversized Payload | Payload > 1024 bytes | Reject + log |
+| MQTT | Manual Block | IP in block list | Reject immediately |
 
 ---
 
@@ -89,7 +95,9 @@ IoT SecOps is a real-time security monitoring platform for IoT device networks. 
 git clone https://github.com/yourusername/iot-secops.git
 cd iot-secops
 
-cp .env.example .env
+copy .env.example .env        # Windows
+# cp .env.example .env        # Mac/Linux
+
 # Open .env and set a strong SECRET_KEY
 
 docker compose up -d
@@ -100,8 +108,9 @@ docker compose up -d
 - Login: `admin` / `admin123`
 
 ```bash
-# Run the IoT simulator (from your machine, not inside Docker)
+# Run the IoT simulator (on your local machine, not in Docker)
 cd backend
+pip install requests
 python simulate_iot.py
 
 # View backend logs
@@ -124,7 +133,7 @@ docker compose down -v
 ```bash
 cd backend
 pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env           # then edit SECRET_KEY
 uvicorn main:app --reload --port 8000
 ```
 
@@ -132,13 +141,13 @@ uvicorn main:app --reload --port 8000
 ```bash
 cd frontend
 npm install
-cp .env.example .env
 npm run dev
 ```
 
 **Terminal 3 — IoT Simulator (optional)**
 ```bash
 cd backend
+pip install requests
 python simulate_iot.py
 ```
 
@@ -150,10 +159,10 @@ Dashboard → **http://localhost:5173**
 
 | Page | Description |
 |------|-------------|
-| **Overview** | Live metrics, dual-protocol traffic chart, attack simulation console, 30s event feed |
-| **Alerts** | Filterable event table (type, severity, protocol, search) with 5-min client history |
-| **Devices** | Per-IP behavioral profiles, risk scoring, click-to-expand detail panel |
-| **Analytics** | SQLite-backed trend charts, top attacking IPs, time range selector, CSV/JSON export |
+| **Overview** | Live metrics (requests, blocked, anomalies, attacks, devices), dual-protocol traffic chart, attack simulation console, 30s security event feed |
+| **Alerts** | Filterable event table by type, severity, and protocol with 5-minute client-side history. Search by IP, device, or event type |
+| **Devices** | Per-IP behavioral profiles, risk scoring (rate limits + anomalies + blocks), click-to-expand detail panel with HTTP/MQTT breakdown |
+| **Analytics** | SQLite-backed trend charts (traffic + attack timeline), threat level distribution, top attacking IPs ranked by count, time range selector (1h/6h/24h/72h), CSV/JSON export |
 
 ---
 
@@ -162,16 +171,20 @@ Dashboard → **http://localhost:5173**
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/user/login` | Dashboard user authentication |
+| GET  | `/user/me` | Get current user from token |
 | POST | `/auth` | IoT device JWT authentication |
-| POST | `/data` | HTTP sensor data (with security checks) |
+| POST | `/data` | HTTP sensor data (rate limit + anomaly + drift checks) |
 | POST | `/mqtt/publish` | MQTT publish simulation |
-| POST | `/mqtt/connect` | MQTT CONNECT simulation |
-| GET | `/metrics` | Current system metrics |
-| GET | `/events` | Recent security events (30s window) |
-| GET | `/history?hours=24` | Metric snapshots from SQLite |
-| GET | `/stats/top-ips?hours=24&limit=10` | Top attacking IPs |
-| GET | `/export/events?fmt=csv&hours=24` | Export events (csv or json) |
-| POST | `/reset` | Reset all counters and events |
+| POST | `/mqtt/connect` | MQTT CONNECT simulation (brute-force check) |
+| GET  | `/metrics` | Current system metrics (HTTP + MQTT) |
+| GET  | `/events` | Recent security events (5-min window) |
+| GET  | `/history?hours=24` | Per-minute metric snapshots from SQLite |
+| GET  | `/stats/top-ips?hours=24&limit=10` | Top attacking IPs by event count |
+| GET  | `/export/events?fmt=csv&hours=24` | Export events as CSV or JSON |
+| POST | `/block_ip?ip=x.x.x.x` | Manually block an IP permanently |
+| POST | `/unblock_ip?ip=x.x.x.x` | Remove a manual block |
+| POST | `/mark_safe?ip=x.x.x.x` | Safe-list an IP (bypasses all checks) |
+| POST | `/reset` | Reset all counters, events, and block lists |
 
 ---
 
@@ -180,18 +193,20 @@ Dashboard → **http://localhost:5173**
 Copy `.env.example` to `.env` and edit:
 
 ```env
-SECRET_KEY=your-strong-random-secret   # change this
+# Backend (backend/.env)
+SECRET_KEY=your-strong-random-secret   # required — change this
 DB_PATH=iot_security.db
 BLOCK_DURATION=30
 RATE_LIMIT=20
 RATE_WINDOW=5
 ANOMALY_THRESHOLD=8
+ANOMALY_WINDOW=1
 MQTT_RATE_LIMIT=15
 MQTT_PAYLOAD_MAX=1024
 ```
 
-Frontend (`frontend/.env`):
 ```env
+# Frontend (frontend/.env)
 VITE_API_URL=http://localhost:8000
 ```
 
@@ -202,45 +217,68 @@ VITE_API_URL=http://localhost:8000
 ```
 iot-secops/
 │
-├── backend/                        # FastAPI backend
+├── backend/
 │   ├── main.py                     # All endpoints + detection logic
+│   │                               #   ├── Rate limiting (HTTP + MQTT)
+│   │                               #   ├── Anomaly burst detection
+│   │                               #   ├── Behavioral drift (EMA baseline)
+│   │                               #   ├── Manual block / safe list
+│   │                               #   ├── SQLite persistence
+│   │                               #   └── CSV/JSON export
 │   ├── simulate_iot.py             # IoT device simulator (HTTP + MQTT)
-│   ├── requirements.txt            # Python dependencies
-│   ├── Dockerfile                  # Backend container
-│   └── .env.example                # Backend environment template
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .env.example
 │
-├── frontend/                       # React frontend
+├── frontend/
 │   ├── src/
 │   │   ├── pages/
 │   │   │   ├── LoginPage.jsx       # JWT user login
 │   │   │   ├── OverviewPage.jsx    # Live metrics + simulation console
 │   │   │   ├── AlertsPage.jsx      # Event table with filters
 │   │   │   ├── DevicesPage.jsx     # IP behavioral profiling
-│   │   │   └── AnalyticsPage.jsx   # History charts + export
+│   │   │   └── AnalyticsPage.jsx   # History charts + export (cached, no flicker)
 │   │   ├── components/
-│   │   │   ├── Sidebar.jsx         # Navigation + user strip + logout
-│   │   │   ├── Topbar.jsx          # Breadcrumb + threat level
-│   │   │   ├── StatCard.jsx        # Metric card
+│   │   │   ├── Sidebar.jsx         # Nav + user strip + logout
+│   │   │   ├── Topbar.jsx          # Breadcrumb + threat level + refresh
+│   │   │   ├── StatCard.jsx        # Animated metric card
 │   │   │   └── EventBadge.jsx      # Type/severity/protocol badges
-│   │   ├── App.jsx                 # Root — auth, routing, polling
+│   │   ├── App.jsx                 # Auth, routing, 4s polling, event history
 │   │   ├── index.css               # Design system (CSS variables)
-│   │   └── main.jsx                # React entry point
+│   │   └── main.jsx
 │   ├── index.html
 │   ├── package.json
 │   ├── vite.config.js
-│   ├── nginx.conf                  # Nginx config for production
-│   ├── Dockerfile                  # Frontend container (Vite → Nginx)
-│   └── .env.example                # Frontend environment template
+│   ├── nginx.conf
+│   ├── Dockerfile
+│   └── .env.example
 │
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                  # GitHub Actions CI
 │
-├── docker-compose.yml              # One-command deploy
-├── .env.example                    # Root environment template
+├── docker-compose.yml
+├── .env.example
 ├── .gitignore
 └── README.md
 ```
+
+---
+
+## Event Types
+
+| Event | Protocol | Severity | Trigger |
+|-------|----------|----------|---------|
+| `rate_limit` | HTTP | HIGH | >20 req/5s from same IP |
+| `anomaly` | HTTP | MEDIUM | >8 req/1s burst |
+| `behavior_drift` | HTTP | MEDIUM | Rate > 2× learned EMA baseline |
+| `ip_blocked` | HTTP | HIGH | Automatic or manual block hit |
+| `mqtt_flood` | MQTT | HIGH | >15 pub/5s from same client |
+| `mqtt_anomaly` | MQTT | MEDIUM | >6 pub/1s burst |
+| `mqtt_auth_fail` | MQTT | HIGH | Invalid key on publish |
+| `mqtt_brute_force` | MQTT | HIGH | >8 CONNECT attempts in 10s |
+| `mqtt_oversized` | MQTT | MEDIUM | Payload > 1024 bytes |
+| `mqtt_blocked` | MQTT | HIGH | Automatic or manual block hit |
 
 ---
 

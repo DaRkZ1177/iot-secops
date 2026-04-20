@@ -44,6 +44,35 @@ function StatusPill({ status }) {
   );
 }
 
+function buildAttackStory(events) {
+  if (!events || events.length === 0) return [];
+
+  const sorted = [...events].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  const story = [];
+
+  sorted.forEach(ev => {
+    const time = ev.time || 'unknown time';
+
+    if (ev.type === 'rate_limit') {
+      story.push(`${time} Traffic spike detected from ${ev.ip || 'unknown IP'}`);
+    }
+    if (ev.type === 'anomaly') {
+      story.push(`${time} Behavioral anomaly observed`);
+    }
+    if (ev.type === 'ip_blocked') {
+      story.push(`${time} IP was blocked after repeated violations`);
+    }
+    if (ev.type === 'mqtt_flood') {
+      story.push(`${time} MQTT flood attack detected`);
+    }
+    if (ev.type === 'mqtt_auth_fail' || ev.type === 'mqtt_brute_force') {
+      story.push(`${time} Multiple failed MQTT authentications`);
+    }
+  });
+
+  return story;
+}
+
 const SORT_OPTS = [
   { val: 'events',    label: 'Event Count' },
   { val: 'risk',      label: 'Risk Score'  },
@@ -357,6 +386,32 @@ export default function DevicesPage({ events, metrics }) {
               <div style={{ marginBottom: 20 }}>
                 <div className="label" style={{ marginBottom: 8 }}>Risk Score</div>
                 <RiskMeter score={selectedDevice.riskScore} />
+
+                <div style={{ marginTop: 16, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button onClick={async () => {
+                    await fetch(`http://localhost:8000/block_ip?ip=${selectedDevice.ip}`, { method: 'POST' });
+                    alert('IP Blocked 🚫');
+                  }} style={{
+                    padding: '6px 12px', background: '#ff4d6a', border: 'none', borderRadius: 6,
+                    color: 'white', cursor: 'pointer', fontFamily: 'var(--font-ui)', fontSize: 12,
+                  }}>Block IP</button>
+
+                  <button onClick={async () => {
+                    await fetch(`http://localhost:8000/unblock_ip?ip=${selectedDevice.ip}`, { method: 'POST' });
+                    alert('IP Unblocked ✅');
+                  }} style={{
+                    padding: '6px 12px', background: '#3ecf8e', border: 'none', borderRadius: 6,
+                    color: 'white', cursor: 'pointer', fontFamily: 'var(--font-ui)', fontSize: 12,
+                  }}>Unblock IP</button>
+
+                  <button onClick={async () => {
+                    await fetch(`http://localhost:8000/mark_safe?ip=${selectedDevice.ip}`, { method: 'POST' });
+                    alert('Marked as Safe 🟢');
+                  }} style={{
+                    padding: '6px 12px', background: '#38bdf8', border: 'none', borderRadius: 6,
+                    color: 'white', cursor: 'pointer', fontFamily: 'var(--font-ui)', fontSize: 12,
+                  }}>Mark Safe</button>
+                </div>
               </div>
 
               {/* HTTP stats */}
@@ -457,6 +512,30 @@ export default function DevicesPage({ events, metrics }) {
                       </div>
                     );
                   })}
+                </div>
+              </div>
+
+              <div style={{ marginTop: 20 }}>
+                <div className="label" style={{ marginBottom: 10 }}>Attack Story</div>
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {buildAttackStory(selectedDevice.eventLog).map((line, i) => (
+                    <div key={i} style={{
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: 12,
+                      color: 'var(--text-muted)',
+                      background: 'var(--bg-elevated)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius)',
+                      padding: '10px 12px',
+                    }}>
+                      {line}
+                    </div>
+                  ))}
+                  {buildAttackStory(selectedDevice.eventLog).length === 0 && (
+                    <div style={{ fontFamily: 'var(--font-ui)', fontSize: 12, color: 'var(--text-dim)' }}>
+                      No attack narrative available for this device.
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

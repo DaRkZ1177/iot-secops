@@ -5,6 +5,7 @@ const TYPE_OPTS = [
   { val: 'all',              label: 'All Types' },
   { val: 'rate_limit',       label: 'Rate Limit' },
   { val: 'anomaly',          label: 'Anomaly' },
+  { val: 'behavior_drift',   label: 'Behavior Drift' },
   { val: 'ip_blocked',       label: 'IP Blocked' },
   { val: 'mqtt_flood',       label: 'MQTT Flood' },
   { val: 'mqtt_anomaly',     label: 'MQTT Burst' },
@@ -58,7 +59,7 @@ export default function AlertsPage({ events, metrics }) {
 
   /* Summary counts */
   const counts = useMemo(() => {
-    const c = { total: 0, rate_limit: 0, anomaly: 0, ip_blocked: 0, HIGH: 0, MEDIUM: 0, LOW: 0,
+    const c = { total: 0, rate_limit: 0, anomaly: 0, behavior_drift: 0, ip_blocked: 0, HIGH: 0, MEDIUM: 0, LOW: 0,
                 mqtt_flood: 0, mqtt_anomaly: 0, mqtt_auth_fail: 0, mqtt_brute_force: 0, mqtt_blocked: 0, mqtt_oversized: 0 };
     allEvents.forEach(e => {
       if (!e || !e.type) return;

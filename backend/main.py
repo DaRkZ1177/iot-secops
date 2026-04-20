@@ -96,6 +96,7 @@ mqtt_ip_requests        = defaultdict(int)
 mqtt_request_timestamps = defaultdict(list)
 
 security_events = deque()
+device_baselines = {}
 
 # Load recent events from DB into hot deque
 cursor.execute(
@@ -110,6 +111,8 @@ for r in cursor.fetchall():
     )
 
 blocked_ips = {}
+manual_blocked_ips = set()
+safe_ips = set()
 mqtt_blocked_ips = {}
 _last_snapshot_ts = 0
 
@@ -219,7 +222,7 @@ def reset():
     mqtt_total = mqtt_blocked = mqtt_anomalies = 0
     ip_requests.clear(); request_timestamps.clear()
     mqtt_ip_requests.clear(); mqtt_request_timestamps.clear()
-    security_events.clear(); blocked_ips.clear(); mqtt_blocked_ips.clear()
+    security_events.clear(); blocked_ips.clear(); manual_blocked_ips.clear(); safe_ips.clear(); mqtt_blocked_ips.clear()
     cursor.execute("DELETE FROM events")
     conn.commit()
     return {"status": "reset complete"}
@@ -237,6 +240,26 @@ async def authenticate(request: Request):
         {"device_id": device_id, "iat": int(time.time())}, SECRET_KEY, algorithm="HS256"
     )
     return {"token": token}
+
+
+@app.post("/block_ip")
+def block_ip(ip: str):
+    manual_blocked_ips.add(ip)
+    safe_ips.discard(ip)
+    return {"status": "blocked", "ip": ip}
+
+
+@app.post("/unblock_ip")
+def unblock_ip(ip: str):
+    manual_blocked_ips.discard(ip)
+    return {"status": "unblocked", "ip": ip}
+
+
+@app.post("/mark_safe")
+def mark_safe(ip: str):
+    manual_blocked_ips.discard(ip)
+    safe_ips.add(ip)
+    return {"status": "safe", "ip": ip}
 
 
 @app.post("/data")
@@ -259,6 +282,16 @@ async def receive_data(request: Request):
     client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
     now       = time.time()
 
+    if client_ip in safe_ips:
+        return {"status": "allowed_safe"}
+
+    if client_ip in manual_blocked_ips:
+        blocked_requests += 1
+        add_event({"type": "ip_blocked", "protocol": "http", "ip": client_ip,
+                   "device": device_id, "timestamp": now,
+                   "time": time.strftime("%H:%M:%S")})
+        return {"error": "IP manually blocked"}
+
     if client_ip in blocked_ips:
         remaining = int(blocked_ips[client_ip] - now)
         if remaining > 0:
@@ -275,6 +308,22 @@ async def receive_data(request: Request):
     request_timestamps[client_ip] = [
         t for t in request_timestamps[client_ip] if now - t < RATE_WINDOW
     ]
+
+    request_count = len(request_timestamps[client_ip])
+    baseline = device_baselines.get(client_ip, 1)
+    device_baselines[client_ip] = baseline * 0.9 + request_count * 0.1
+
+    if request_count > baseline * 2:
+        anomalies_detected += 1
+        add_event({
+            "type": "behavior_drift",
+            "protocol": "http",
+            "ip": client_ip,
+            "device": device_id,
+            "timestamp": now,
+            "time": time.strftime("%H:%M:%S"),
+        })
+        return {"warning": "Behavioral drift detected"}
 
     if len(request_timestamps[client_ip]) > RATE_LIMIT:
         blocked_requests += 1
@@ -302,6 +351,16 @@ async def mqtt_publish(request: Request):
     forwarded = request.headers.get("X-Forwarded-For")
     client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
     now       = time.time()
+
+    if client_ip in safe_ips:
+        return {"status": "allowed_safe"}
+
+    if client_ip in manual_blocked_ips:
+        mqtt_blocked += 1
+        add_event({"type": "mqtt_blocked", "protocol": "mqtt", "ip": client_ip,
+                   "device": client_id, "timestamp": now,
+                   "time": time.strftime("%H:%M:%S")})
+        return {"error": "MQTT client manually blocked"}
 
     if not any(v == mqtt_key for v in VALID_DEVICES.values()):
         mqtt_blocked += 1
@@ -363,6 +422,15 @@ async def mqtt_connect(request: Request):
     forwarded = request.headers.get("X-Forwarded-For")
     client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
     now       = time.time()
+
+    if client_ip in safe_ips:
+        return {"status": "allowed_safe"}
+
+    if client_ip in manual_blocked_ips:
+        mqtt_blocked += 1
+        add_event({"type": "mqtt_blocked", "protocol": "mqtt", "ip": client_ip,
+                   "device": "unknown", "timestamp": now, "time": time.strftime("%H:%M:%S")})
+        return {"error": "MQTT client manually blocked"}
 
     try:
         data = await request.json()

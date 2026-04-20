@@ -15,6 +15,11 @@ export const EVENT_CONFIG = {
     border: 'rgba(255,140,66,0.3)', severity: 'HIGH', severityColor: '#ff4d6a',
     protocol: 'http',
   },
+  behavior_drift: {
+    label: 'Drift', color: '#ff9f43', bg: 'rgba(255,159,67,0.14)',
+    border: 'rgba(255,159,67,0.3)', severity: 'MEDIUM', severityColor: '#ff9f43',
+    protocol: 'http',
+  },
   // MQTT events
   mqtt_flood: {
     label: 'MQTT Flood', color: '#ff4d6a', bg: 'rgba(255,77,106,0.14)',
