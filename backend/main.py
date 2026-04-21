@@ -30,19 +30,28 @@ MQTT_ANOMALY_WINDOW    = 1
 SECURITY_WINDOW        = 30
 EVENT_HISTORY_WINDOW   = 300
 
+# ── CHANGE: aggregation thresholds for threat level ───────────────────────────
+# Single events no longer escalate to HIGH. Sustained patterns do.
+THREAT_HIGH_RATE_LIMIT_COUNT  = 3   # >= 3 rate_limit/mqtt_flood events in 30s → HIGH
+THREAT_HIGH_BRUTE_FORCE_COUNT = 2   # >= 2 brute_force events in 30s → HIGH
+THREAT_MEDIUM_ANOMALY_COUNT   = 3   # >= 3 anomaly/drift events in 30s → MEDIUM
+
 # ── Database ──────────────────────────────────────────────────────────────────
 conn   = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.executescript("""
 CREATE TABLE IF NOT EXISTS events (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    type      TEXT,
-    protocol  TEXT,
-    ip        TEXT,
-    device    TEXT,
-    timestamp REAL,
-    time      TEXT
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    type           TEXT,
+    protocol       TEXT,
+    ip             TEXT,
+    device         TEXT,
+    device_type    TEXT DEFAULT 'unknown',
+    event_intensity REAL DEFAULT 0.0,
+    behavior_type  TEXT DEFAULT 'normal',
+    timestamp      REAL,
+    time           TEXT
 );
 CREATE TABLE IF NOT EXISTS metrics_history (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,12 +73,23 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 conn.commit()
 
+# Schema migrations — safe to run on existing DBs
+for col, defval in [
+    ("device_type TEXT DEFAULT 'unknown'", "device_type"),
+    ("event_intensity REAL DEFAULT 0.0",   "event_intensity"),
+    ("behavior_type TEXT DEFAULT 'normal'", "behavior_type"),
+]:
+    try:
+        cursor.execute(f"ALTER TABLE events ADD COLUMN {col}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
 
 def _hash_pw(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
 
-# Seed default admin on first run
 cursor.execute("SELECT COUNT(*) FROM users")
 if cursor.fetchone()[0] == 0:
     cursor.execute(
@@ -79,12 +99,38 @@ if cursor.fetchone()[0] == 0:
     conn.commit()
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="IoT SecOps API", version="2.0.0")
+app = FastAPI(title="IoT SecOps API", version="4.0.0")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-VALID_DEVICES = {"device_1": "key123", "device_2": "key456", "device_3": "key789"}
+VALID_DEVICES = {
+    "device_1":          "key123",
+    "device_2":          "key456",
+    "device_3":          "key789",
+    "cctv_entrance":     "key123",
+    "hvac_floor2":       "key456",
+    "smart_lock_server": "key789",
+    "sensor_warehouse":  "key123",
+    "gateway_main":      "key456",
+}
+
+DEVICE_TYPE_MAP = {
+    "cctv_entrance":     "cctv",
+    "hvac_floor2":       "hvac",
+    "smart_lock_server": "smart_lock",
+    "sensor_warehouse":  "sensor",
+    "gateway_main":      "gateway",
+    "device_1": "sensor", "device_2": "sensor", "device_3": "sensor",
+}
+
+DEVICE_PROFILES_STATIC = [
+    {"device_id": "cctv_entrance",     "device_type": "cctv",       "ip": "192.168.1.10", "protocol": "http",  "description": "Entrance CCTV Camera",       "attack_type": "burst",       "normal_behavior": "Motion events every 2-4s",  "attack_behavior": "Frame burst storm → rate_limit"},
+    {"device_id": "hvac_floor2",       "device_type": "hvac",       "ip": "192.168.1.20", "protocol": "http",  "description": "HVAC Unit Floor 2",           "attack_type": "drift",       "normal_behavior": "Telemetry every 3-6s",       "attack_behavior": "Abnormal sensor values → behavior_drift"},
+    {"device_id": "smart_lock_server", "device_type": "smart_lock", "ip": "192.168.1.30", "protocol": "mqtt",  "description": "Server Room Smart Lock",      "attack_type": "brute_force", "normal_behavior": "Status ping every 5-10s",   "attack_behavior": "CONNECT spam → mqtt_brute_force"},
+    {"device_id": "sensor_warehouse",  "device_type": "sensor",     "ip": "192.168.1.40", "protocol": "mqtt",  "description": "Warehouse Environment Sensor", "attack_type": "mqtt_flood",  "normal_behavior": "Publish every 2-5s",        "attack_behavior": "Publish flood → mqtt_flood"},
+    {"device_id": "gateway_main",      "device_type": "gateway",    "ip": "192.168.1.50", "protocol": "http",  "description": "Main Network Gateway",        "attack_type": "oversized",   "normal_behavior": "Heartbeat every 4-8s",      "attack_behavior": "Oversized payload → mqtt_oversized"},
+]
 
 # ── In-memory metrics ─────────────────────────────────────────────────────────
 total_requests = blocked_requests = anomalies_detected = 0
@@ -96,25 +142,31 @@ mqtt_ip_requests        = defaultdict(int)
 mqtt_request_timestamps = defaultdict(list)
 
 security_events = deque()
-device_baselines = {}
 
-# Load recent events from DB into hot deque
+# ── CHANGE: per-device memory (behavioral baseline + last value) ──────────────
+# Structure: { ip: { "baseline": float, "last_value": float, "last_ts": float } }
+device_memory = defaultdict(lambda: {"baseline": 1.0, "last_value": None, "last_ts": 0.0})
+
+# Load recent events from DB
 cursor.execute(
-    "SELECT type, protocol, ip, device, timestamp, time FROM events "
-    "WHERE timestamp > ? ORDER BY timestamp ASC",
+    "SELECT type, protocol, ip, device, device_type, event_intensity, behavior_type, timestamp, time "
+    "FROM events WHERE timestamp > ? ORDER BY timestamp ASC",
     (time.time() - EVENT_HISTORY_WINDOW,),
 )
 for r in cursor.fetchall():
-    security_events.append(
-        {"type": r[0], "protocol": r[1], "ip": r[2],
-         "device": r[3], "timestamp": r[4], "time": r[5]}
-    )
+    security_events.append({
+        "type": r[0], "protocol": r[1], "ip": r[2], "device": r[3],
+        "device_type": r[4] or "unknown",
+        "event_intensity": r[5] or 0.0,
+        "behavior_type":  r[6] or "normal",
+        "timestamp": r[7], "time": r[8],
+    })
 
-blocked_ips = {}
+blocked_ips        = {}
 manual_blocked_ips = set()
-safe_ips = set()
-mqtt_blocked_ips = {}
-_last_snapshot_ts = 0
+safe_ips           = set()
+mqtt_blocked_ips   = {}
+_last_snapshot_ts  = 0
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -124,12 +176,27 @@ def prune_events():
         security_events.popleft()
 
 
+def get_request_metadata(request: Request, device_id: str) -> dict:
+    """
+    Extract all simulation metadata from headers.
+    Falls back to sensible defaults if headers are absent (e.g. manual curl).
+    """
+    device_type = request.headers.get("X-Device-Type", "") or DEVICE_TYPE_MAP.get(device_id, "unknown")
+    try:
+        intensity = max(0.0, min(1.0, float(request.headers.get("X-Event-Intensity", "0.0"))))
+    except (ValueError, TypeError):
+        intensity = 0.0
+    behavior_type = request.headers.get("X-Behavior-Type", "normal") or "normal"
+    return {"device_type": device_type, "intensity": intensity, "behavior_type": behavior_type}
+
+
 def add_event(event: dict):
     now   = time.time()
     etype = event.get("type", "")
     eip   = event.get("ip", "")
     prune_events()
 
+    # Dedup
     if etype in ("ip_blocked", "mqtt_blocked"):
         window_start = now - BLOCK_DURATION
         for ev in reversed(list(security_events)):
@@ -141,17 +208,42 @@ def add_event(event: dict):
         for ev in reversed(list(security_events)):
             if now - ev["timestamp"] > 2:
                 break
-            if (ev["type"] == etype and ev["ip"] == eip
-                    and ev.get("device") == event.get("device")):
+            if ev["type"] == etype and ev["ip"] == eip and ev.get("device") == event.get("device"):
                 return
+
+    # Defaults
+    if not event.get("device_type"):
+        event["device_type"] = DEVICE_TYPE_MAP.get(event.get("device", ""), "unknown")
+    event.setdefault("event_intensity", 0.0)
+    event.setdefault("behavior_type", "normal")
 
     security_events.append(event)
     cursor.execute(
-        "INSERT INTO events (type, protocol, ip, device, timestamp, time) VALUES (?,?,?,?,?,?)",
-        (event.get("type"), event.get("protocol"), event.get("ip"),
-         event.get("device"), event.get("timestamp"), event.get("time")),
+        "INSERT INTO events (type, protocol, ip, device, device_type, event_intensity, behavior_type, timestamp, time) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (event.get("type"), event.get("protocol"), event.get("ip"), event.get("device"),
+         event.get("device_type", "unknown"), event.get("event_intensity", 0.0),
+         event.get("behavior_type", "normal"),
+         event.get("timestamp", now), event.get("time", time.strftime("%H:%M:%S"))),
     )
     conn.commit()
+
+
+# ── CHANGE: aggregation-based threat level ────────────────────────────────────
+def compute_threat_level(recent_events: list) -> str:
+    """
+    Count event types in the recent window.
+    HIGH requires SUSTAINED attack (>= threshold count), not a single event.
+    """
+    rate_limit_count  = sum(1 for e in recent_events if e["type"] in ("rate_limit", "mqtt_flood"))
+    brute_force_count = sum(1 for e in recent_events if e["type"] in ("mqtt_brute_force",))
+    anomaly_count     = sum(1 for e in recent_events if e["type"] in ("anomaly", "mqtt_anomaly", "behavior_drift"))
+
+    if rate_limit_count >= THREAT_HIGH_RATE_LIMIT_COUNT or brute_force_count >= THREAT_HIGH_BRUTE_FORCE_COUNT:
+        return "HIGH"
+    if anomaly_count >= THREAT_MEDIUM_ANOMALY_COUNT:
+        return "MEDIUM"
+    return "LOW"
 
 
 def snapshot_metrics(threat_level: str):
@@ -180,7 +272,7 @@ def verify_user_token(request: Request):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# USER AUTH
+# USER AUTH — unchanged
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.post("/user/login")
@@ -222,7 +314,9 @@ def reset():
     mqtt_total = mqtt_blocked = mqtt_anomalies = 0
     ip_requests.clear(); request_timestamps.clear()
     mqtt_ip_requests.clear(); mqtt_request_timestamps.clear()
-    security_events.clear(); blocked_ips.clear(); manual_blocked_ips.clear(); safe_ips.clear(); mqtt_blocked_ips.clear()
+    security_events.clear(); blocked_ips.clear()
+    manual_blocked_ips.clear(); safe_ips.clear(); mqtt_blocked_ips.clear()
+    device_memory.clear()
     cursor.execute("DELETE FROM events")
     conn.commit()
     return {"status": "reset complete"}
@@ -244,8 +338,7 @@ async def authenticate(request: Request):
 
 @app.post("/block_ip")
 def block_ip(ip: str):
-    manual_blocked_ips.add(ip)
-    safe_ips.discard(ip)
+    manual_blocked_ips.add(ip); safe_ips.discard(ip)
     return {"status": "blocked", "ip": ip}
 
 
@@ -257,9 +350,13 @@ def unblock_ip(ip: str):
 
 @app.post("/mark_safe")
 def mark_safe(ip: str):
-    manual_blocked_ips.discard(ip)
-    safe_ips.add(ip)
+    manual_blocked_ips.discard(ip); safe_ips.add(ip)
     return {"status": "safe", "ip": ip}
+
+
+@app.get("/devices/profiles")
+def device_profiles():
+    return {"devices": DEVICE_PROFILES_STATIC}
 
 
 @app.post("/data")
@@ -282,14 +379,21 @@ async def receive_data(request: Request):
     client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
     now       = time.time()
 
+    # ── CHANGE: extract simulation metadata ──────────────────────────────────
+    meta = get_request_metadata(request, device_id)
+    device_type   = meta["device_type"]
+    intensity     = meta["intensity"]
+    behavior_type = meta["behavior_type"]
+
     if client_ip in safe_ips:
         return {"status": "allowed_safe"}
 
     if client_ip in manual_blocked_ips:
         blocked_requests += 1
         add_event({"type": "ip_blocked", "protocol": "http", "ip": client_ip,
-                   "device": device_id, "timestamp": now,
-                   "time": time.strftime("%H:%M:%S")})
+                   "device": device_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": "IP manually blocked"}
 
     if client_ip in blocked_ips:
@@ -297,8 +401,9 @@ async def receive_data(request: Request):
         if remaining > 0:
             blocked_requests += 1
             add_event({"type": "ip_blocked", "protocol": "http", "ip": client_ip,
-                       "device": device_id, "timestamp": now,
-                       "time": time.strftime("%H:%M:%S"), "remaining": remaining})
+                       "device": device_id, "device_type": device_type,
+                       "event_intensity": intensity, "behavior_type": behavior_type,
+                       "timestamp": now, "time": time.strftime("%H:%M:%S"), "remaining": remaining})
             return {"error": f"IP blocked for {remaining}s"}
         del blocked_ips[client_ip]
 
@@ -310,35 +415,48 @@ async def receive_data(request: Request):
     ]
 
     request_count = len(request_timestamps[client_ip])
-    baseline = device_baselines.get(client_ip, 1)
-    device_baselines[client_ip] = baseline * 0.9 + request_count * 0.1
 
-    if request_count > baseline * 2:
+    # ── CHANGE: per-device memory — baseline + delta detection ───────────────
+    mem      = device_memory[client_ip]
+    baseline = mem["baseline"]
+
+    # Update EMA baseline (slow: 90% old, 10% new)
+    mem["baseline"] = baseline * 0.9 + request_count * 0.1
+
+    # ── CHANGE: context-aware drift detection ─────────────────────────────────
+    # If simulation says this is an anomaly OR request rate is double baseline
+    is_drift = (behavior_type == "anomaly") or (request_count > baseline * 2 and baseline > 2)
+    if is_drift and request_count > ANOMALY_THRESHOLD:
         anomalies_detected += 1
         add_event({
-            "type": "behavior_drift",
-            "protocol": "http",
-            "ip": client_ip,
-            "device": device_id,
-            "timestamp": now,
-            "time": time.strftime("%H:%M:%S"),
+            "type": "behavior_drift", "protocol": "http",
+            "ip": client_ip, "device": device_id, "device_type": device_type,
+            "event_intensity": intensity, "behavior_type": behavior_type,
+            "timestamp": now, "time": time.strftime("%H:%M:%S"),
         })
         return {"warning": "Behavioral drift detected"}
 
-    if len(request_timestamps[client_ip]) > RATE_LIMIT:
+    # ── Rate limit check ──────────────────────────────────────────────────────
+    if request_count > RATE_LIMIT:
         blocked_requests += 1
         blocked_ips[client_ip] = now + BLOCK_DURATION
         add_event({"type": "rate_limit", "protocol": "http", "ip": client_ip,
-                   "device": device_id, "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": device_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": f"Rate limit exceeded → IP blocked for {BLOCK_DURATION}s"}
 
+    # ── Burst anomaly check ───────────────────────────────────────────────────
     burst = [t for t in request_timestamps[client_ip] if now - t < ANOMALY_WINDOW]
     if len(burst) > ANOMALY_THRESHOLD:
         anomalies_detected += 1
         add_event({"type": "anomaly", "protocol": "http", "ip": client_ip,
-                   "device": device_id, "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": device_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"warning": "Anomalous traffic detected"}
 
+    mem["last_ts"] = now
     return {"status": "data accepted", "protocol": "http"}
 
 
@@ -346,11 +464,17 @@ async def receive_data(request: Request):
 async def mqtt_publish(request: Request):
     global mqtt_total, mqtt_blocked, mqtt_anomalies
 
-    mqtt_key  = request.headers.get("X-MQTT-Key")
-    client_id = request.headers.get("X-MQTT-ClientId", "unknown")
-    forwarded = request.headers.get("X-Forwarded-For")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
-    now       = time.time()
+    mqtt_key    = request.headers.get("X-MQTT-Key")
+    client_id   = request.headers.get("X-MQTT-ClientId", "unknown")
+    forwarded   = request.headers.get("X-Forwarded-For")
+    client_ip   = forwarded.split(",")[0].strip() if forwarded else request.client.host
+    now         = time.time()
+
+    # ── CHANGE: extract simulation metadata ──────────────────────────────────
+    meta          = get_request_metadata(request, client_id)
+    device_type   = meta["device_type"]
+    intensity     = meta["intensity"]
+    behavior_type = meta["behavior_type"]
 
     if client_ip in safe_ips:
         return {"status": "allowed_safe"}
@@ -358,14 +482,17 @@ async def mqtt_publish(request: Request):
     if client_ip in manual_blocked_ips:
         mqtt_blocked += 1
         add_event({"type": "mqtt_blocked", "protocol": "mqtt", "ip": client_ip,
-                   "device": client_id, "timestamp": now,
-                   "time": time.strftime("%H:%M:%S")})
+                   "device": client_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": "MQTT client manually blocked"}
 
     if not any(v == mqtt_key for v in VALID_DEVICES.values()):
         mqtt_blocked += 1
         add_event({"type": "mqtt_auth_fail", "protocol": "mqtt", "ip": client_ip,
-                   "device": client_id, "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": client_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": "MQTT authentication failed"}
 
     if client_ip in mqtt_blocked_ips:
@@ -373,8 +500,9 @@ async def mqtt_publish(request: Request):
         if remaining > 0:
             mqtt_blocked += 1
             add_event({"type": "mqtt_blocked", "protocol": "mqtt", "ip": client_ip,
-                       "device": client_id, "timestamp": now,
-                       "time": time.strftime("%H:%M:%S"), "remaining": remaining})
+                       "device": client_id, "device_type": device_type,
+                       "event_intensity": intensity, "behavior_type": behavior_type,
+                       "timestamp": now, "time": time.strftime("%H:%M:%S"), "remaining": remaining})
             return {"error": f"MQTT client blocked for {remaining}s"}
         del mqtt_blocked_ips[client_ip]
 
@@ -387,8 +515,9 @@ async def mqtt_publish(request: Request):
     if len(payload_str) > MQTT_PAYLOAD_MAX:
         mqtt_blocked += 1
         add_event({"type": "mqtt_oversized", "protocol": "mqtt", "ip": client_ip,
-                   "device": client_id, "timestamp": now,
-                   "time": time.strftime("%H:%M:%S"), "size": len(payload_str)})
+                   "device": client_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S"), "size": len(payload_str)})
         return {"error": "Payload exceeds maximum size"}
 
     mqtt_total += 1
@@ -402,14 +531,18 @@ async def mqtt_publish(request: Request):
         mqtt_blocked += 1
         mqtt_blocked_ips[client_ip] = now + BLOCK_DURATION
         add_event({"type": "mqtt_flood", "protocol": "mqtt", "ip": client_ip,
-                   "device": client_id, "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": client_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": f"MQTT flood detected → client blocked for {BLOCK_DURATION}s"}
 
     burst = [t for t in mqtt_request_timestamps[client_ip] if now - t < MQTT_ANOMALY_WINDOW]
     if len(burst) > MQTT_ANOMALY_THRESHOLD:
         mqtt_anomalies += 1
         add_event({"type": "mqtt_anomaly", "protocol": "mqtt", "ip": client_ip,
-                   "device": client_id, "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": client_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"warning": "MQTT anomalous publish rate detected"}
 
     return {"status": "published", "protocol": "mqtt",
@@ -429,7 +562,9 @@ async def mqtt_connect(request: Request):
     if client_ip in manual_blocked_ips:
         mqtt_blocked += 1
         add_event({"type": "mqtt_blocked", "protocol": "mqtt", "ip": client_ip,
-                   "device": "unknown", "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": "unknown", "device_type": "unknown",
+                   "event_intensity": 0.0, "behavior_type": "normal",
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": "MQTT client manually blocked"}
 
     try:
@@ -440,20 +575,34 @@ async def mqtt_connect(request: Request):
     client_id = data.get("client_id", "unknown")
     password  = data.get("password", "")
 
+    # ── CHANGE: extract metadata ──────────────────────────────────────────────
+    meta          = get_request_metadata(request, client_id)
+    device_type   = meta["device_type"]
+    intensity     = meta["intensity"]
+    behavior_type = meta["behavior_type"]
+
     key = f"mqtt_connect_{client_ip}"
     request_timestamps[key].append(now)
     request_timestamps[key] = [t for t in request_timestamps[key] if now - t < 10]
 
-    if len(request_timestamps[key]) > 8:
+    # ── CHANGE: brute force threshold now context-aware ───────────────────────
+    # If simulation declares behavior_type="brute", we treat it as confirmed
+    # Otherwise use count-based detection.
+    # threshold stays at 8 — low-chaos brute attacks (4-6 attempts) stay as auth_fail
+    if len(request_timestamps[key]) > 8 or (behavior_type == "brute" and len(request_timestamps[key]) > 5):
         mqtt_blocked += 1
         add_event({"type": "mqtt_brute_force", "protocol": "mqtt", "ip": client_ip,
-                   "device": client_id, "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": client_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": "MQTT broker: too many connect attempts — possible brute force"}
 
     if not any(v == password for v in VALID_DEVICES.values()):
         mqtt_blocked += 1
         add_event({"type": "mqtt_auth_fail", "protocol": "mqtt", "ip": client_ip,
-                   "device": client_id, "timestamp": now, "time": time.strftime("%H:%M:%S")})
+                   "device": client_id, "device_type": device_type,
+                   "event_intensity": intensity, "behavior_type": behavior_type,
+                   "timestamp": now, "time": time.strftime("%H:%M:%S")})
         return {"error": "MQTT broker: authentication refused"}
 
     return {"status": "connected", "protocol": "mqtt",
@@ -468,17 +617,34 @@ async def mqtt_connect(request: Request):
 def metrics():
     now = time.time()
     prune_events()
-    recent   = [e for e in security_events if now - e["timestamp"] < SECURITY_WINDOW]
-    has_rate = any(e["type"] in ("rate_limit", "mqtt_flood") for e in recent)
-    has_anom = any(e["type"] in ("anomaly", "mqtt_anomaly", "mqtt_brute_force") for e in recent)
-    threat   = "HIGH" if has_rate else ("MEDIUM" if has_anom else "LOW")
+    recent = [e for e in security_events if now - e["timestamp"] < SECURITY_WINDOW]
+
+    # ── CHANGE: aggregation-based threat level ────────────────────────────────
+    threat = compute_threat_level(recent)
     snapshot_metrics(threat)
+
     return {
-        "total_requests": total_requests, "blocked_requests": blocked_requests,
-        "anomalies": anomalies_detected, "attack_attempts": blocked_requests,
-        "unique_ips": len(ip_requests), "threat_level": threat,
-        "mqtt_total": mqtt_total, "mqtt_blocked": mqtt_blocked,
-        "mqtt_anomalies": mqtt_anomalies, "mqtt_unique_ips": len(mqtt_ip_requests),
+        "total_requests":  total_requests,
+        "blocked_requests": blocked_requests,
+        "anomalies":       anomalies_detected,
+        "attack_attempts": blocked_requests,
+        "unique_ips":      len(ip_requests),
+        "threat_level":    threat,
+        "mqtt_total":      mqtt_total,
+        "mqtt_blocked":    mqtt_blocked,
+        "mqtt_anomalies":  mqtt_anomalies,
+        "mqtt_unique_ips": len(mqtt_ip_requests),
+        # ── CHANGE: expose event counts so frontend can show thresholds ────────
+        "threat_counts": {
+            "rate_limit":   sum(1 for e in recent if e["type"] in ("rate_limit", "mqtt_flood")),
+            "brute_force":  sum(1 for e in recent if e["type"] == "mqtt_brute_force"),
+            "anomaly":      sum(1 for e in recent if e["type"] in ("anomaly", "mqtt_anomaly", "behavior_drift")),
+            "thresholds": {
+                "high_rate_limit":  THREAT_HIGH_RATE_LIMIT_COUNT,
+                "high_brute_force": THREAT_HIGH_BRUTE_FORCE_COUNT,
+                "medium_anomaly":   THREAT_MEDIUM_ANOMALY_COUNT,
+            },
+        },
     }
 
 
@@ -490,7 +656,6 @@ def events():
 
 @app.get("/history")
 def history(hours: int = 24):
-    """Per-minute metric snapshots for the last N hours — used by Analytics page."""
     since = int(time.time()) - hours * 3600
     cursor.execute(
         "SELECT ts, total_requests, blocked_requests, anomalies, "
@@ -500,40 +665,37 @@ def history(hours: int = 24):
     )
     return {"history": [
         {"ts": r[0], "total_requests": r[1], "blocked_requests": r[2],
-         "anomalies": r[3], "mqtt_total": r[4], "mqtt_blocked": r[5],
-         "threat_level": r[6]}
+         "anomalies": r[3], "mqtt_total": r[4], "mqtt_blocked": r[5], "threat_level": r[6]}
         for r in cursor.fetchall()
     ]}
 
 
 @app.get("/stats/top-ips")
 def top_ips(limit: int = 10, hours: int = 24):
-    """Top attacking IPs by event count over the last N hours."""
     since = time.time() - hours * 3600
     cursor.execute(
         "SELECT ip, COUNT(*) as cnt FROM events WHERE timestamp >= ? "
-        "GROUP BY ip ORDER BY cnt DESC LIMIT ?",
-        (since, limit),
+        "GROUP BY ip ORDER BY cnt DESC LIMIT ?", (since, limit),
     )
     return {"top_ips": [{"ip": r[0], "count": r[1]} for r in cursor.fetchall()]}
 
 
 @app.get("/export/events")
 def export_events(hours: int = 24, protocol: str = "all", fmt: str = "csv"):
-    """Export stored events as CSV or JSON. Params: hours, protocol (all/http/mqtt), fmt."""
     since  = time.time() - hours * 3600
-    query  = "SELECT type, protocol, ip, device, timestamp, time FROM events WHERE timestamp >= ?"
+    query  = ("SELECT type, protocol, ip, device, device_type, event_intensity, "
+              "behavior_type, timestamp, time FROM events WHERE timestamp >= ?")
     params: list = [since]
     if protocol in ("http", "mqtt"):
-        query  += " AND protocol = ?"
-        params.append(protocol)
+        query += " AND protocol = ?"; params.append(protocol)
     query += " ORDER BY timestamp DESC"
     cursor.execute(query, params)
     rows = cursor.fetchall()
 
     if fmt == "json":
-        data = [{"type": r[0], "protocol": r[1], "ip": r[2],
-                 "device": r[3], "timestamp": r[4], "time": r[5]} for r in rows]
+        data = [{"type": r[0], "protocol": r[1], "ip": r[2], "device": r[3],
+                 "device_type": r[4], "event_intensity": r[5], "behavior_type": r[6],
+                 "timestamp": r[7], "time": r[8]} for r in rows]
         return StreamingResponse(
             io.StringIO(_json.dumps(data, indent=2)), media_type="application/json",
             headers={"Content-Disposition": "attachment; filename=iot_events.json"},
@@ -541,7 +703,8 @@ def export_events(hours: int = 24, protocol: str = "all", fmt: str = "csv"):
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["type", "protocol", "ip", "device", "timestamp", "time"])
+    writer.writerow(["type", "protocol", "ip", "device", "device_type",
+                     "event_intensity", "behavior_type", "timestamp", "time"])
     writer.writerows(rows)
     buf.seek(0)
     return StreamingResponse(
